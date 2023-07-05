@@ -1,0 +1,4 @@
+for using SG90 servo motor at WeMos D1 R1
+
+initialize like below.
+  myservo.attach(PIN, 500, 2400);
