@@ -3,8 +3,39 @@
 #include <LiquidCrystal_I2C.h>
 #include <Adafruit_NeoPixel.h>
 #include <DHT11.h>
+#include <math.h>
 
-//#define SERIAL_DEBUG
+#define Fs 20.0 // float 40
+#define D_Lth 256 // Dependent to Fs 512
+#define MedFilterWinSize 21 // Dependent to Fs 41
+#define NumCutSample 10 // Dependent to Fs 20
+#define Z_Lth 2048 //(int)(Fs*60) //Fs*60 보다 큰 2의 거듭제곱수 4096
+
+
+// #define Fs 30.0 // float 40
+// #define D_Lth 384  // Dependent to Fs 512
+// #define MedFilterWinSize 31 // Dependent to Fs 41
+// #define NumCutSample 15 // Dependent to Fs 20
+// #define Z_Lth 2048 //(int)(Fs*60) //Fs*60 보다 큰 2의 거듭제곱수 4096
+
+// float b0 = 0.9391;
+// float b1 = -1.8782;
+// float b2 = 0.9391;
+// float a1 = -1.8734;
+// float a2 = 0.8784;
+
+// 2차 Butterworth 하이패스 필터 계수 (Dependent to Fs and Fc(0.8Hz))
+float b0 = 0.7548;
+float b1 = -1.5096;
+float b2 = 0.7548;
+float a1 = -1.4461;
+float a2 = 0.5741;
+
+int DD_Lth = D_Lth-(NumCutSample*2);
+int DD_Rng[2] = {NumCutSample, NumCutSample+DD_Lth-1};
+float vReal[Z_Lth], vImag[Z_Lth];
+
+#define SERIAL_DEBUG
 
 #define SW1 pinL10 
 #define SW2 pinL09
@@ -21,33 +52,6 @@
 #define VALVE_B       pinR09
 #define PUMP_A        pinR15
 #define PUMP_B        pinR16
-
-#define Fs 20
-//#define D_Lth 512
-#define D_Lth 256
-#define Z_Lth 2048
-#define F_EndIdx 513
-#define LimCoeff 1.5
-#define HalfMedWinSize 10
-
-const int bpmHzRngIdx[2] = {81, 341}; // (47bpm to 200bpm) 
-int PeakIdx;
-float PeakVal;
-int brpm;
-int bpm;
-float MedValD;
-float UpperVal;
-float LowerVal;
-float UpperLim;
-float LowerLim;
-
-//float F[F_EndIdx];
-float F[Z_Lth];
-float D[D_Lth];
-float MedFiltD[D_Lth];
-float MedFiltD2[D_Lth];
-float tempMedFiltD[D_Lth];
-float SigTF[Z_Lth], vImag[Z_Lth];  
 
 
 ArduinoFFT<float> FFT;
@@ -76,6 +80,9 @@ long maxPress = 12000000;
 
 
 long readPressure(int pinSCK, int pinVout);
+void MedianFilter(float *Data, int DataSize, int WindowSize);
+void AscendSort(float *Data, int ArrSize);
+int DetectPPM();
 
 void setup()
 {
@@ -186,6 +193,10 @@ void loop()
   { // cal Heart Rate
     buzzerBeep(250);
 
+    int Idx, brpm, bpm;
+    float D[D_Lth], FiltD[D_Lth], SumX = 0, SumY = 0, SumXY = 0, SumXX = 0, Slope, Intercept;
+    float x1 = 0, x2 = 0, y1 = 0, y2 = 0; 
+
     //check person on pad
     if(setAirDone && isPerson)
     {
@@ -193,16 +204,9 @@ void loop()
       RGB_LED.show();
       lcd.setCursor(0,0); lcd.print("*IoT Sensor Pad*");
       lcd.setCursor(0,1); lcd.print("Measuring Data..");
-      for (int i = 0; i < F_EndIdx; i++) 
-      { 
-        F[i] = (float)i * (float)Fs / (float)Z_Lth; 
-#ifdef SERIAL_DEBUG
-        //Serial.println(F[i]);
-#endif
-      }
 
       unsigned long previousMillis = 0; 
-      const long interval = 50; // 50 ms interval for 20Hz 
+      const long interval = 1000/Fs; //50; // 50 ms interval for 20Hz 
       int dataCount = 0; 
       
       while (dataCount < D_Lth) 
@@ -213,202 +217,109 @@ void loop()
           previousMillis = currentMillis; 
           D[dataCount] = readPressure(PRESSURE_SCK, PRESSURE_DOU); 
 #ifdef SERIAL_DEBUG
-        // Serial.println( D[dataCount]);
+          Serial.println( D[dataCount]);
 #endif          
           dataCount++; 
         } 
       }
-//-------------------Breath Rate---------------------------
-      for (int i = 0; i < D_Lth; i++)
-      {
-        int SttArrIdx = i - HalfMedWinSize;
-        int EndArrIdx = i + HalfMedWinSize;
-        int ArrIdxSize;
 
-        if (SttArrIdx < 0)
-        {
-          SttArrIdx = 0;
-          ArrIdxSize = EndArrIdx + 1;
-        }
-        else if (EndArrIdx >= D_Lth)
-        {
-          EndArrIdx = D_Lth - 1;
-          ArrIdxSize = EndArrIdx - SttArrIdx+1;
-        }
-        else
-        {
-          ArrIdxSize = Fs + 1;
-        }
-        
-        //ArrIdxSize = 1;
-
-        float TempArr[ArrIdxSize];
-        int k = 0;
-#ifdef SERIAL_DEBUG 
-        // Serial.println("ArrIdxSize : " + String(ArrIdxSize));
-        // Serial.println("Index Range : "+ String(SttArrIdx) + " to " + String(EndArrIdx));
-        // Serial.print(" - TempArr: ");
-#endif
-        for (int j = SttArrIdx; j <= EndArrIdx; j++)
-        //for (int j = i; j <= i; j++)
-        {
-          TempArr[k] = D[j];
-          k++;
-#ifdef SERIAL_DEBUG         
-          // Serial.print(String(TempArr[k]) + ", ");
-#endif
-        }
-#ifdef SERIAL_DEBUG       
-        // Serial.println();
-#endif
-        MedFiltD[i] = findMedian(TempArr, ArrIdxSize);
-        tempMedFiltD[i] = MedFiltD[i];
-#ifdef SERIAL_DEBUG       
-        // Serial.println(" - MedFiltD : "+ String(MedFiltD[i]));
-#endif
-      }
-
-     MedValD = findMedian(tempMedFiltD, D_Lth);
-#ifdef SERIAL_DEBUG
-        //  Serial.println("=================D==============="); 
-        //  for(int i= 0 ; i<D_Lth ; i++)  Serial.println(D[i]);
-        //  Serial.println("===============MedFiltD================");
-        //  for(int i= 0 ; i<D_Lth ; i++)  Serial.println(MedFiltD[i]);
-        //  Serial.println("==================================");
-#endif
-    #ifdef SERIAL_DEBUG
-      //Serial.println(MedValD);
-    #endif
-
-      for (int i = 0; i<D_Lth; i++) // delete bias
-      {
-        MedFiltD[i] = MedFiltD[i] - MedValD;
-        D[i] = D[i] - MedValD;
-      }
-
-      UpperVal = MedFiltD[0];
-      LowerVal = MedFiltD[0];  
-
-      for (int i = 1; i<D_Lth; i++) // find Max value from filtered Value
-      {
-        if (UpperVal<MedFiltD[i])
-        {
-          UpperVal = MedFiltD[i];
-        }
-        
-        if (LowerVal>MedFiltD[i])
-        {
-          LowerVal = MedFiltD[i];
-        }
-      }
-
-      UpperLim = UpperVal * LimCoeff;
-      LowerLim = LowerVal * LimCoeff;
+    while(1)
+    {
+      float AbsDD[DD_Lth], SortDD[DD_Lth], MAD;
+      bool BreakFlag = 1;
 
       for (int i = 0; i<D_Lth; i++)
       {
-        if (UpperLim<D[i])
-        {
-          D[i] = UpperLim;
-        }
-        else if (D[i]<LowerLim)
-        {
-          D[i] = LowerLim;
-        }
+        FiltD[i] = D[i];        
       }
 
-      detrendData(MedFiltD,MedFiltD2,D_Lth);
+      MedianFilter(FiltD, D_Lth, MedFilterWinSize);
 
-      for (int i = 0; i<D_Lth; i++) // to D_Lth, real data
+      Idx = 0;
+
+      for (int i = DD_Rng[0]; i<=DD_Rng[1]; i++)
       {
-        //SigTF[i] = D[i];
-        SigTF[i] = MedFiltD2[i];
-        vImag[i] = 0;
+        AbsDD[Idx] = abs(D[i]-FiltD[i]);
+        SortDD[Idx] = AbsDD[Idx];
+        Idx++;
       }
 
-#ifdef SERIAL_DEBUG
-         Serial.println("==================================");
-         for(int i= 0 ; i<D_Lth ; i++)  Serial.println(D[i]);
-         Serial.println("==================================");
-         for(int i= 0 ; i<D_Lth ; i++)  Serial.println(MedFiltD[i]);
-         Serial.println("===============MedFiltD2=============");
-         for(int i= 0 ; i<D_Lth ; i++)  Serial.println(MedFiltD2[i]);
-         Serial.println("==================================");
-#endif 
+      AscendSort(SortDD, DD_Lth);
+      MAD = SortDD[(int)round(DD_Lth*0.90)]*3;
 
-      for (int i = D_Lth; i<Z_Lth; i++) // D_Lth to Z_Lth, set zeros
+      Idx = 0;
+
+      for (int i = DD_Rng[0]; i<=DD_Rng[1]; i++)
       {
-        SigTF[i] = 0;    
-        vImag[i] = 0;
+        if (MAD<AbsDD[Idx])
+        {
+          D[i] = FiltD[i];
+          BreakFlag = 0;
+        }
+
+        Idx++;
       }
 
-      lcd.setCursor(0,1); lcd.print("Analyzing Data...");
+      if (BreakFlag==1)
+      {
+        break;
+      } 
+    }
+//-------------------Breath Rate---------------------------
       
-      //FFT
-      //FFT.windowing(SigTF, Z_Lth, FFT_WIN_TYP_RECTANGLE, FFT_FORWARD);  
-      FFT.windowing(SigTF, Z_Lth, FFT_WIN_TYP_HAMMING, FFT_FORWARD);  
-      FFT.compute(SigTF, vImag, Z_Lth, FFT_FORWARD);
+    lcd.setCursor(0,1); lcd.print("Analyzing Data...");
+    for (int i = DD_Rng[0]; i<=DD_Rng[1]; i++)
+    {
+      SumX += i;
+      SumY += FiltD[i];
+      SumXY += i*FiltD[i];
+      SumXX += i*i;
+    }
+    lcd.setCursor(0,1); lcd.print("STEP1           ");
+    Slope = (DD_Lth*SumXY-SumX*SumY)/(DD_Lth*SumXX-SumX*SumX);
+    Intercept = (SumY-Slope*SumX)/DD_Lth;
 
-      PeakIdx = 0;
-      PeakVal = 0;
+    Idx = 0;
 
-      for (int i = 0; i<F_EndIdx; i++)
-      {
-        //double magnitude = sqrt(SigF[i]*SigF[i]+vImag[i]*vImag[i]);
-        double magnitude = sqrt(SigTF[i]*SigTF[i]+vImag[i]*vImag[i]);
-
-        if (PeakVal < magnitude)
-        {
-          PeakVal = magnitude;
-          PeakIdx = i;
-        }
-      }
-
-      brpm = F[PeakIdx]*60;
+    for (int i = DD_Rng[0]; i<=DD_Rng[1]; i++)
+    {
+      vReal[Idx] = FiltD[i]-(Slope*Idx+Intercept);
+      vImag[Idx] = 0;
+      Idx++;
+    }
+    lcd.setCursor(0,1); lcd.print("STEP2           ");
+    brpm = DetectPPM(); 
+    lcd.setCursor(0,1); lcd.print("STEP3           ");
 
 //-------------------Heart Rate---------------------------
-      for (int i = 0; i<D_Lth; i++)
-      {
-        SigTF[i] = D[i] - MedFiltD[i];
-        vImag[i] = 0;
-      }
-      
-      for (int i = D_Lth; i<Z_Lth; i++)
-      {
-        SigTF[i] = 0;
-        vImag[i] = 0;
-      }
 
-      //FFT.windowing(SigTF, Z_Lth, FFT_WIN_TYP_RECTANGLE, FFT_FORWARD);  
-      FFT.windowing(SigTF, Z_Lth, FFT_WIN_TYP_HAMMING, FFT_FORWARD);  
-      FFT.compute(SigTF, vImag, Z_Lth, FFT_FORWARD);
+for (int i = 0; i<D_Lth; i++)
+  {
+    D[i] = D[i]-FiltD[i];
+  }
 
-      PeakIdx = bpmHzRngIdx[0];
-      PeakVal = 0;
+  MedianFilter(D, D_Lth, 5);  
 
-      //for (int i = bpmHzRngIdx[1]; i<bpmHzRngIdx[2]; i++)
-//      for (int i = bpmHzRngIdx[1]; i<F_EndIdx; i++)
-      for (int i = bpmHzRngIdx[0]; i<bpmHzRngIdx[1]; i++)
-      {
-        //double magnitude = sqrt(SigTF[i]*SigTF[i]+vImag[i]*vImag[i]);
-        double magnitude = sqrt((double)SigTF[i]*(double)SigTF[i]+(double)vImag[i]*(double)vImag[i]);
+  for (int i = 1; i<D_Lth; i++)
+  {
+    FiltD[i] = b0*D[i]+b1*x1+b2*x2-a1*y1-a2*y2;
+    x2 = x1;
+    x1 = D[i];
+    y2 = y1;
+    y1 = FiltD[i];
+  }
 
-        if (PeakVal<magnitude)
-        {
-          PeakVal = magnitude;
-          PeakIdx = i;
-        }
-      }
+  Idx = 0;
 
-      bpm = F[PeakIdx]*60;
+  for (int i = DD_Rng[0]; i<=DD_Rng[1]; i++)
+  {
+    vReal[Idx] = FiltD[i];
+    vImag[Idx] = 0;
+    Idx++;
+  }
 
-#ifdef SERIAL_DEBUG
-      Serial.print("brpm : ");
-      Serial.println(brpm);
+  bpm = DetectPPM(); 
 
-      Serial.print("bpm : ");
-      Serial.println(bpm);
-#endif
 
       lcd.setCursor(0,0); lcd.print("B_rpm :             ");
       lcd.setCursor(0,1); lcd.print("H_rpm :             ");
@@ -616,53 +527,100 @@ long avgPressure(void)
   return avgPress;
 }
 
-float findMedian(float arr[], int n) // for DC bias
-{     
-  for (int i = 0; i<(n-1); i++)
-  {
-    for (int j = 0; j<(n-i-1); j++)
-    {
-      if (arr[j]>arr[j+1])
-      {
-        float temp = arr[j];
-        arr[j] = arr[j+1];
-        arr[j+1] = temp;
-      }
-    }
-  }
-  
-  if ((n%2)!=0) 
-  { 
-    return arr[(n+1)/2 - 1];
-  }
-  else 
-  {
-    return (arr[(n/2)-1] + arr[n/2])/2; 
-  }  
-}
-
-
-void detrendData(float* inputData, float* outputData, int size) {
-  float sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
-  
-  for (int i = 0; i < size; i++) {
-    sumX += i;
-    sumY += inputData[i];
-    sumXY += i * inputData[i];
-    sumXX += i * i;
-  }
-
-  float slope = (size * sumXY - sumX * sumY) / (size * sumXX - sumX * sumX);
-  float intercept = (sumY - slope * sumX) / size;
-
-  for (int i = 0; i < size; i++) {
-    outputData[i] = inputData[i] - (slope * i + intercept);
-  }
-}
 
 void buzzerBeep(int T)
 { 
   analogWrite(BUZZER, 150);
   delay(T);
   analogWrite(BUZZER, 0);
+}
+
+//-----------20250626
+
+void MedianFilter(float *Data, int DataSize, int WindowSize)
+{
+  float OriData[DataSize], WindowData[WindowSize];
+  int HalfWindowSize = (WindowSize-1)/2, WindowIdx;
+
+  for (int i = 0; i<DataSize; i++)
+  {
+    OriData[i] = Data[i];
+  }
+
+  for (int i = 0; i<DataSize; i++)
+  {
+    WindowIdx = 0;
+
+    for (int j = i-HalfWindowSize; j<=i+HalfWindowSize; j++)
+    {
+      if ((j<0)||(DataSize<=j))
+      {
+        WindowData[WindowIdx] = 0;
+      }
+      else
+      {
+        WindowData[WindowIdx] = OriData[j];
+      }
+
+      WindowIdx++;
+    }
+
+    AscendSort(WindowData, WindowSize);
+    Data[i] = WindowData[HalfWindowSize];
+  }
+}
+
+void AscendSort(float *Data, int ArrSize)
+{
+  for (int i = 0; i<(ArrSize-1); i++)
+  {
+    for (int j = 0; j<(ArrSize-1-i); j++)
+    {
+      if (Data[j]>Data[j+1])
+      {
+        float Temp = Data[j];
+        Data[j] = Data[j+1];
+        Data[j+1] = Temp;
+      }
+    }
+  }
+}
+
+int DetectPPM()
+{
+  int PeakIdx = 0;
+  float F, Magnitude, PeakVal = 0;
+
+  for (int i = DD_Lth; i<Z_Lth; i++)
+  {
+    vReal[i] = 0;    
+    vImag[i] = 0;
+  }
+  lcd.setCursor(0,1); lcd.print("STEP2.1         ");
+  FFT.windowing(vReal, Z_Lth, FFT_WIN_TYP_HAMMING, FFT_FORWARD);  
+  lcd.setCursor(0,1); lcd.print("STEP2.2         ");
+  FFT.compute(vReal, vImag, Z_Lth, FFT_FORWARD); 
+  lcd.setCursor(0,1); lcd.print("STEP2.3         ");
+  for (int i = 0; i<Z_Lth; i++)
+  {
+    F = (float)i*Fs/(float)Z_Lth;
+    Magnitude = sqrt(vReal[i]*vReal[i]+vImag[i]*vImag[i]);
+
+    if (F>5.0)
+    {
+      lcd.setCursor(0,1); lcd.print("STEP2.4         ");
+      delay(1000);     
+      return ((float)PeakIdx * Fs * 60.0)/ (float)Z_Lth;
+     //return 1000;
+   
+    }
+
+    if (PeakVal<Magnitude)
+    {
+      PeakVal = Magnitude;
+      PeakIdx = i;
+    }
+  }
+
+  //return 1000;
 }
